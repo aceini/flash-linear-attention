@@ -130,7 +130,8 @@ class QuasarAttention(nn.Module):
             )
 
         batch_size, q_len, _ = hidden_states.shape
-        mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
+        # Force chunk mode to avoid fused_recurrent BT conflict
+        mode = "chunk"
         if self.training:
             assert mode == "chunk", "Only chunk mode is supported in training."
 

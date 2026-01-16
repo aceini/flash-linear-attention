@@ -23,7 +23,7 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3]
     ],
-    key=['B', 'H', 'S', 'BT'],
+    key=['B', 'H', 'S'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -40,7 +40,7 @@ def fused_recurrent_quasar_fwd_kernel(
     B: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
-    BT: tl.constexpr,
+    BT,
     BS: tl.constexpr,
     HAS_INITIAL_STATE: tl.constexpr,
     OUTPUT_FINAL_STATE: tl.constexpr,

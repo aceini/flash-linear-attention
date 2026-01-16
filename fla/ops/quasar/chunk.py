@@ -35,10 +35,20 @@ def chunk_quasar_fwd(
     """
     B, T, H, S = q.shape
     BT = chunk_size
+    original_T = T
     
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    
+    # Pad if T is not a multiple of BT
+    if T % BT != 0:
+        pad_len = BT - (T % BT)
+        q = F.pad(q, (0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, pad_len))
+        v = F.pad(v, (0, 0, 0, pad_len))
+        T = T + pad_len
+        NT = triton.cdiv(T, BT)
     
     # Reshape to chunks
     q_chunks = q.view(B, H, NT, BT, S)
@@ -124,6 +134,10 @@ def chunk_quasar_fwd(
         o[:, i*BT:(i+1)*BT] = o_c
     
     final_state = state if output_final_state else None
+    
+    # Trim output back to original size if padded
+    if original_T != T:
+        o = o[:, :original_T]
     
     return o, final_state
 
