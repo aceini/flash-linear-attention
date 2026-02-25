@@ -5,8 +5,11 @@ import triton.language as tl
 from fla.ops.quasar.gate import fused_quasar_gate
 from fla.ops.quasar.forward_substitution import forward_substitution_kernel
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.utils import autocast_custom_fwd, autocast_custom_bwd
-from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
+from fla.utils import autocast_custom_fwd
+from fla.utils import autocast_custom_bwd
+from fla.utils import autotune_cache_kwargs
+from fla.utils import check_shared_mem
+from fla.utils import input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BT_LIST_AUTOTUNE = [32, 64, 128]
