@@ -322,3 +322,72 @@ def chunk_quasar(
     return ChunkQuasarFunction.apply(
         q, k, v, beta, initial_state, output_final_state, cu_seqlens
     )
+
+
+# =========================================================================
+# Fast forward path: pre-allocated buffers, no autograd, no Python overhead
+# =========================================================================
+_fast_buffers = {}
+
+
+def chunk_quasar_fwd_fast(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """Ultra-fast forward: pre-allocated buffers, BV=32, optimized stages."""
+    if q.dtype != torch.bfloat16:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        beta = beta.to(torch.bfloat16)
+
+    B, T, H, S = q.shape
+    BT = chunk_size
+    NT = triton.cdiv(T, BT)
+    BH = B * H
+    n_chunks = BH * NT
+    BV = 32 if S >= 32 else S
+
+    # Re-use buffers if same shape (avoids cudaMalloc per call)
+    cache_key = (B, T, H, S, BT)
+    if cache_key not in _fast_buffers:
+        _fast_buffers.clear()  # Only cache one shape
+        _fast_buffers[cache_key] = (
+            torch.empty(n_chunks, S, S, device=q.device, dtype=torch.bfloat16),
+            torch.empty(n_chunks, S, S, device=q.device, dtype=torch.bfloat16),
+            torch.empty(B, T, H, S, device=q.device, dtype=torch.bfloat16),
+        )
+    A_trans, KtU, o = _fast_buffers[cache_key]
+
+    rec_stages = 3 if S <= 64 else (2 if S <= 96 else 1)
+
+    s1 = torch.cuda.Stream()
+    s2 = torch.cuda.Stream()
+
+    with torch.cuda.stream(s1):
+        intra_chunk_v9[(n_chunks,)](
+            k, v, beta,
+            A_trans, KtU,
+            T, NT=NT, BT=BT, S=S, H=H,
+            num_warps=4,
+            num_stages=4,
+        )
+
+    s2.wait_stream(s1)
+    with torch.cuda.stream(s2):
+        recurrence_v9[(triton.cdiv(S, BV), BH)](
+            q, A_trans, KtU, o,
+            q.new_empty(1), q.new_empty(1),
+            T, NT,
+            BT=BT, S=S, BV=BV, H=H,
+            USE_INITIAL_STATE=False,
+            STORE_FINAL_STATE=False,
+            num_warps=4,
+            num_stages=rec_stages,
+        )
+
+    torch.cuda.current_stream().wait_stream(s2)
+    return o
