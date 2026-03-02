@@ -1,5 +1,5 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# Modified for QuasarAttention — v14 ultra-optimized layer
+# Modified for QuasarAttention — v15 ultra-optimized layer
 
 from __future__ import annotations
 
@@ -95,17 +95,17 @@ class QuasarAttention(nn.Module):
 
         device = self.q_proj.weight.device
 
-        # Pre-cast fused QKV weight to bf16 transposed for torch.mm
+        # Pre-cast fused QKV weight to bf16 transposed for torch.mm (detached)
         self._qkv_w = torch.cat([
-            self.q_proj.weight, self.k_proj.weight, self.v_proj.weight
+            self.q_proj.weight.data, self.k_proj.weight.data, self.v_proj.weight.data
         ], dim=0).to(torch.bfloat16).t().contiguous()
 
-        # Pre-compute fused gate (collapse 2-layer MLP: W2 @ W1)
+        # Pre-compute fused gate (collapse 2-layer MLP: W2 @ W1, detached)
         g0, g1 = self.g_proj[0], self.g_proj[1]
-        self._g_w = (g1.weight @ g0.weight).to(torch.bfloat16).t().contiguous()
-        self._g_b = g1.bias.data.to(torch.bfloat16)
+        self._g_w = (g1.weight.data @ g0.weight.data).to(torch.bfloat16).t().contiguous()
+        self._g_b = g1.bias.data.to(torch.bfloat16).contiguous()
 
-        # Pre-cast output projection weight
+        # Pre-cast output projection weight (detached)
         self._o_w = self.o_proj.weight.data.to(torch.bfloat16).t().contiguous()
 
         # Pre-compute beta
@@ -222,8 +222,7 @@ class QuasarAttention(nn.Module):
 
     @torch.no_grad()
     def _fast_forward(self, hidden_states):
-        """Ultra-optimized forward: pre-cast bf16, fused QKV, skip conv,
-        pre-alloc buffers, overlap gate with kernel, event sync."""
+        """v15: BV=16, intra ns=2, detached weights, pre-alloc all buffers."""
         import triton
         from fla.ops.quasar.chunk import intra_chunk_v9, recurrence_v9
 
@@ -234,39 +233,49 @@ class QuasarAttention(nn.Module):
         H = self.num_heads
         S = self.head_dim
         BT = 256
-        # Adaptive BV and stages to avoid shared memory overflow for large S
-        BV = 32 if S <= 64 else (16 if S <= 128 else 8)
+        # BV=16 confirmed faster than BV=32 for all S<=128
+        BV = 16 if S <= 128 else 8
         BV = min(BV, S)
 
-        # Get pre-allocated buffers
+        # Get pre-allocated kernel buffers
         A_trans, KtU, o_buf, NT, BH, n_chunks = self._get_buffers(B, T, H, S, BT)
+
+        # Get or create pre-allocated matmul buffers
+        extra_key = ("extra", B, T, D)
+        if extra_key not in self._buf_cache:
+            dev = self._qkv_w.device
+            self._buf_cache[extra_key] = (
+                torch.empty(B * T, 3 * self.key_dim, device=dev, dtype=torch.bfloat16),
+                torch.empty(B * T, self.key_dim, device=dev, dtype=torch.bfloat16),
+                torch.empty(B * T, D, device=dev, dtype=torch.bfloat16),
+            )
+        qkv_buf, g_buf, out_buf = self._buf_cache[extra_key]
 
         x_bf = hidden_states.to(torch.bfloat16).reshape(-1, D)
         shape = (B, T, H, S)
 
-        # Single fused QKV matmul (bf16, no autocast overhead)
-        qkv = torch.mm(x_bf, self._qkv_w)
-        q, k, v = qkv.split(self.key_dim, dim=-1)
-        q = q.view(shape)
-        k = k.view(shape)
-        v = v.view(shape)
+        # Single fused QKV matmul (bf16, pre-alloc output)
+        torch.mm(x_bf, self._qkv_w, out=qkv_buf)
+        q = qkv_buf[:, :self.key_dim].view(shape)
+        k = qkv_buf[:, self.key_dim:2*self.key_dim].view(shape)
+        v = qkv_buf[:, 2*self.key_dim:].view(shape)
 
-        # Overlap: gate matmul on separate stream
+        # Overlap: gate matmul on separate stream (pre-alloc output)
         with torch.cuda.stream(self._s3):
-            g = torch.addmm(self._g_b, x_bf, self._g_w).view(shape)
+            torch.addmm(self._g_b, x_bf, self._g_w, out=g_buf)
 
-        # Intra-chunk kernel
+        # Intra-chunk kernel (ns=2 confirmed optimal)
         with torch.cuda.stream(self._s1):
             intra_chunk_v9[(n_chunks,)](
                 k, v, self._beta_fixed,
                 A_trans, KtU,
                 T, NT=NT, BT=BT, S=S, H=H,
                 num_warps=4,
-                num_stages=4 if S <= 64 else (2 if S <= 96 else 1),
+                num_stages=2 if S <= 96 else 1,
             )
             self._e1.record(self._s1)
 
-        # Recurrence kernel (waits for intra via event)
+        # Recurrence kernel (ns=3 confirmed optimal)
         self._s2.wait_event(self._e1)
         with torch.cuda.stream(self._s2):
             recurrence_v9[(triton.cdiv(S, BV), BH)](
@@ -284,8 +293,8 @@ class QuasarAttention(nn.Module):
         torch.cuda.current_stream().wait_stream(self._s2)
         torch.cuda.current_stream().wait_stream(self._s3)
 
-        # Norm + output projection (bf16 direct matmul)
-        o = self.o_norm(o_buf, g)
-        o = torch.mm(o.reshape(-1, self.key_dim), self._o_w).view(B, T, D)
+        # Norm + output projection (pre-alloc output)
+        o = self.o_norm(o_buf, g_buf.view(shape))
+        torch.mm(o.reshape(-1, self.key_dim), self._o_w, out=out_buf)
 
-        return o, None, None
+        return out_buf.view(B, T, D), None, None
