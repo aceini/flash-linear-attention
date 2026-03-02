@@ -26,6 +26,7 @@ from .retention import chunk_retention, fused_chunk_retention, fused_recurrent_r
 from .rwkv6 import chunk_rwkv6, fused_recurrent_rwkv6
 from .rwkv7 import chunk_rwkv7, fused_recurrent_rwkv7
 from .simple_gla import chunk_simple_gla, fused_chunk_simple_gla, fused_recurrent_simple_gla, parallel_simple_gla
+from .quasar import chunk_quasar, fused_recurrent_quasar
 
 __all__ = [
     'chunk_abc',
@@ -51,4 +52,5 @@ __all__ = [
     'chunk_rwkv6', 'fused_recurrent_rwkv6',
     'chunk_rwkv7', 'fused_recurrent_rwkv7',
     'chunk_simple_gla', 'fused_chunk_simple_gla', 'fused_recurrent_simple_gla', 'parallel_simple_gla',
+    'chunk_quasar', 'fused_recurrent_quasar',
 ]
