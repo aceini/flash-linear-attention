@@ -150,7 +150,9 @@ class QuasarAttention(nn.Module):
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         cu_seqlens = kwargs.get("cu_seqlens")
-        if not use_cache and attention_mask is None and past_key_values is None and cu_seqlens is None:
+        # Fast path: no caching, no masks, no grad (benchmark/inference)
+        if (not use_cache and attention_mask is None and past_key_values is None
+                and cu_seqlens is None and not hidden_states.requires_grad):
             return self._fast_forward(hidden_states)
 
         # Original path for caching / attention masks / cu_seqlens
@@ -232,7 +234,9 @@ class QuasarAttention(nn.Module):
         H = self.num_heads
         S = self.head_dim
         BT = 256
-        BV = 32 if S >= 32 else S
+        # Adaptive BV and stages to avoid shared memory overflow for large S
+        BV = 32 if S <= 64 else (16 if S <= 128 else 8)
+        BV = min(BV, S)
 
         # Get pre-allocated buffers
         A_trans, KtU, o_buf, NT, BH, n_chunks = self._get_buffers(B, T, H, S, BT)
@@ -257,7 +261,8 @@ class QuasarAttention(nn.Module):
                 k, v, self._beta_fixed,
                 A_trans, KtU,
                 T, NT=NT, BT=BT, S=S, H=H,
-                num_warps=4, num_stages=4,
+                num_warps=4,
+                num_stages=4 if S <= 64 else (2 if S <= 96 else 1),
             )
             self._e1.record(self._s1)
 
@@ -272,7 +277,7 @@ class QuasarAttention(nn.Module):
                 USE_INITIAL_STATE=False,
                 STORE_FINAL_STATE=False,
                 num_warps=4,
-                num_stages=3,
+                num_stages=3 if S <= 64 else (2 if S <= 96 else 1),
             )
 
         # Wait for kernel + gate
